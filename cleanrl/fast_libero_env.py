@@ -20,11 +20,12 @@ class FastLIBEROEnv:
     Reward: dense distance-based reward.
     """
     
-    def __init__(self, benchmark_name='libero_spatial', task_id=0, max_episode_steps=300, num_sim_steps=1):
+    def __init__(self, benchmark_name='libero_spatial', task_id=0, max_episode_steps=300, num_sim_steps=1, render_mode=None):
         self.benchmark_name = benchmark_name
         self.task_id = task_id
         self.max_episode_steps = max_episode_steps
         self.current_step = 0
+        self.render_mode = render_mode
         
         # Get task
         benchmark_dict = benchmark.get_benchmark_dict()

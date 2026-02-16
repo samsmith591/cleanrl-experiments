@@ -6,10 +6,18 @@ Trains a policy to solve LIBERO-Spatial tasks using PPO with state-based or imag
 import os
 import sys
 
-# Add LIBERO to path
-LIBERO_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "LIBERO")
-if LIBERO_PATH not in sys.path:
-    sys.path.insert(0, LIBERO_PATH)
+# Add LIBERO to path - check multiple possible locations
+import os
+possible_paths = [
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "LIBERO"),
+    "/teamspace/studios/this_studio/LIBERO",
+    os.path.expanduser("~/LIBERO"),
+]
+for LIBERO_PATH in possible_paths:
+    if os.path.exists(LIBERO_PATH):
+        if LIBERO_PATH not in sys.path:
+            sys.path.insert(0, LIBERO_PATH)
+        break
 
 import random
 import time
@@ -103,6 +111,8 @@ class Args:
     """the target KL divergence threshold"""
     max_episode_steps: int = 300
     """maximum steps per episode"""
+    num_sim_steps: int = 1
+    """number of physics simulation steps per action (frame skipping for speed)"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -130,10 +140,12 @@ def make_env(args, idx=0, seed=0):
         )
         
         # Create environment - use DenseRewardEnv for dense rewards
+        # Disable camera observations when using state-based input for speed
         env_args = {
             "bddl_file_name": task_bddl_file,
             "camera_heights": args.camera_height if args.use_image else 128,
-            "camera_widths": args.camera_width if args.use_image else 128
+            "camera_widths": args.camera_width if args.use_image else 128,
+            "use_camera_obs": args.use_image,  # Disable camera rendering for speed when using state input
         }
         if args.dense_reward:
             env = DenseRewardEnv(**env_args)
@@ -257,25 +269,27 @@ class Agent(nn.Module):
 
 class LIBEROWrapper:
     """Wrapper to make LIBERO compatible with the PPO training loop."""
-    def __init__(self, env, init_state=None, max_steps=300, use_image=False, image_shape=(3, 128, 128)):
+    def __init__(self, env, init_state=None, max_steps=300, use_image=False, image_shape=(3, 128, 128), num_sim_steps=1):
         self.env = env
         self.init_state = init_state
         self.max_steps = max_steps
         self.use_image = use_image
         self.current_step = 0
+        self.num_sim_steps = num_sim_steps
         
         # Get action space from the environment's spec or sim
+        # Default to 7 DOF (arm + gripper) for LIBERO
         if hasattr(env, 'action_space'):
             self.action_space = env.action_space
-        elif hasattr(env, 'sim') and hasattr(env.sim, 'actuators'):
-            import gym
-            actuator_ctrlrange = env.sim.model.actuator_ctrlrange
-            low = actuator_ctrlrange[:, 0]
-            high = actuator_ctrlrange[:, 1]
-            self.action_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
         else:
             import gym
-            self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(7,), dtype=np.float32)
+            # Try to get from sim, but default to 7 for LIBERO
+            if hasattr(env, 'sim') and hasattr(env.sim.model, 'actuator_ctrlrange'):
+                # Use first 7 actuators (arm) - LIBERO uses 7 DOF arm
+                nu = min(env.sim.model.nu, 7)
+            else:
+                nu = 7
+            self.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(nu,), dtype=np.float32)
         
         # Get state dimension for state-based encoding
         # Sample observation to get state dimension
@@ -387,7 +401,15 @@ class LIBEROWrapper:
     def step(self, action):
         # Clip action to valid range
         action = np.clip(action, self.action_space.low, self.action_space.high)
-        obs, reward, done, info = self.env.step(action)
+        
+        # Frame skipping: run multiple sim steps per action
+        total_reward = 0
+        for _ in range(self.num_sim_steps):
+            obs, reward, done, info = self.env.step(action)
+            total_reward += reward
+            if done:
+                break
+        
         self.current_step += 1
         
         # Truncate if max steps reached
@@ -395,7 +417,7 @@ class LIBEROWrapper:
             done = True
             info['TimeLimit.truncated'] = True
         
-        return obs, reward, done, False, info
+        return obs, total_reward, done, False, info
     
     def close(self):
         self.env.close()
@@ -459,7 +481,7 @@ if __name__ == "__main__":
     # env setup
     env, init_state = make_env(args, idx=0, seed=args.seed)()
     image_shape = (3, args.camera_height, args.camera_width) if args.use_image else None
-    env = LIBEROWrapper(env, init_state, max_steps=args.max_episode_steps, use_image=args.use_image, image_shape=image_shape)
+    env = LIBEROWrapper(env, init_state, max_steps=args.max_episode_steps, use_image=args.use_image, image_shape=image_shape, num_sim_steps=args.num_sim_steps)
     
     # Get action dimension
     action_dim = env.single_action_space.shape[0]
