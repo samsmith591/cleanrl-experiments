@@ -52,12 +52,16 @@ class Args:
     num_steps: int = 64
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    num_minibatches: int = 4
+    num_minibatches: int = 8
+    """the number of mini-batches - increased from 4 to 8 for better sample efficiency"""
     update_epochs: int = 4
     norm_adv: bool = True
     clip_coef: float = 0.2
     ent_coef: float = 0.0
     vf_coef: float = 0.5
+    """value function coefficient"""
+    exploration_std: float = 0.3
+    """exploration noise (standard deviation) - lower = less erratic, more stable"""
     max_grad_norm: float = 0.5
     target_kl: float = None
 
@@ -75,7 +79,10 @@ def make_env(args):
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, obs_dim, action_dim, hidden_dims=[256, 256]):
+    def __init__(self, obs_dim, action_dim, args=None):
+        hidden_dims = [256, 256]
+        
+        # Policy network
         super().__init__()
         
         # Policy network
@@ -100,8 +107,12 @@ class ActorCritic(nn.Module):
             in_dim = h_dim
         self.value = nn.Sequential(*value_layers, nn.Linear(in_dim, 1))
         
-        # Log std for exploration
-        self.log_std = nn.Parameter(torch.zeros(action_dim))
+        # Log std for exploration - use config value (lower = less erratic)
+        if args and hasattr(args, 'exploration_std'):
+            init_log_std = np.log(args.exploration_std)
+        else:
+            init_log_std = 0.0  # exp(0) = 1.0 std
+        self.log_std = nn.Parameter(torch.full((action_dim,), init_log_std))
         
     def get_value(self, x):
         return self.value(x)
@@ -145,8 +156,8 @@ def train(args):
     action_dim = env.action_space.shape[0]
     print(f"Obs dim: {obs_dim}, Action dim: {action_dim}")
     
-    # Model
-    model = ActorCritic(obs_dim, action_dim).to(device)
+    # Model - pass args for exploration_std
+    model = ActorCritic(obs_dim, action_dim, args).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
     
     # Storage
@@ -294,7 +305,16 @@ def train(args):
         
         if global_step % 1000 == 0:
             print(f"Step {global_step}/{args.total_timesteps}, Episodes: {episode_count}")
+        
+        # Save model periodically
+        if global_step % 50000 == 0 and global_step > 0:
+            os.makedirs("runs", exist_ok=True)
+            torch.save(model.state_dict(), f"runs/model_{global_step}.pt")
+            print(f"Saved model at step {global_step}")
     
+    # Save final model
+    os.makedirs("runs", exist_ok=True)
+    torch.save(model.state_dict(), "runs/model_final.pt")
     print("Training complete!")
     env.close()
     

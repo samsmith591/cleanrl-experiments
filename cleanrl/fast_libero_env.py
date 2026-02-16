@@ -49,7 +49,8 @@ class FastLIBEROEnv:
         self._setup()
         
         # Observation space: robot proprio (14) + object positions (6 per object)
-        self.obs_dim = 14 + 6 * len(self.target_objects)
+        # Observation space: joint positions (7) + relative object positions (6 for 2 objects)
+        self.obs_dim = 7 + 6 * len(self.target_objects)  # 7 + 6*2 = 19
         self.observation_space = gym.spaces.Box(
             low=-10, high=10, shape=(self.obs_dim,), dtype=np.float32
         )
@@ -85,31 +86,30 @@ class FastLIBEROEnv:
         self.ctrlrange = self.env.sim.model.actuator_ctrlrange[:self._action_dim]
         
     def _get_obs(self):
-        """Fast observation: robot proprio + object positions"""
+        """Observation: robot pose + object positions relative to gripper"""
         sim = self.env.sim
         
-        # Robot proprioception (qpos + qvel) - use sim directly
+        # Robot joint positions (7)
         qpos = sim.data.qpos[:self._action_dim]
-        qvel = sim.data.qvel[:self._action_dim]
-        proprio = np.concatenate([qpos, qvel])
         
-        # Object positions (just xyz)
-        obj_pos = []
+        # Object positions relative to gripper
+        gripper_pos = sim.data.body_xpos[self.robot.eef_site_id]
+        
+        rel_obj_pos = []
         for name in self.target_objects:
             try:
                 body_id = sim.model.body_name2id(name)
-                pos = sim.data.body_xpos[body_id]
-                obj_pos.append(pos[:3])
+                obj_pos = sim.data.body_xpos[body_id]
+                # Relative position: object - gripper
+                rel_pos = obj_pos - gripper_pos
+                rel_obj_pos.append(rel_pos)
             except:
-                obj_pos.append(np.zeros(3))
+                rel_obj_pos.append(np.zeros(3))
         
-        # Goal position (approximate - use table center)
-        goal_pos = np.array([0.0, 0.2, 0.0])  # Approximate goal location
+        # Combine: joint_pos (7) + relative positions (6 for 2 objects)
+        obs = np.concatenate([qpos] + rel_obj_pos).astype(np.float32)
         
-        # Combine
-        obs = np.concatenate([proprio] + obj_pos + [goal_pos]).astype(np.float32)
-        
-        # Pad if needed
+        # Pad to fixed size
         if len(obs) < self.obs_dim:
             obs = np.pad(obs, (0, self.obs_dim - len(obs)))
         elif len(obs) > self.obs_dim:
@@ -118,30 +118,39 @@ class FastLIBEROEnv:
         return obs
     
     def _compute_reward(self, action):
-        """Dense reward: distance to goal + action penalty"""
+        """Dense reward: gripper->bowl + bowl->plate distances"""
         sim = self.env.sim
         
         # Get gripper position
         gripper_pos = sim.data.body_xpos[self.robot.eef_site_id]
         
-        # Get first object position
+        # Get object positions (assume first is bowl, second is plate)
         try:
-            obj_pos = sim.data.body_xpos[
+            bowl_pos = sim.data.body_xpos[
                 sim.model.body_name2id(self.target_objects[0])
             ]
         except:
-            obj_pos = np.zeros(3)
+            bowl_pos = np.zeros(3)
         
-        # Distance reward (negative distance)
-        dist = np.linalg.norm(gripper_pos[:2] - obj_pos[:2])  # 2D distance
+        try:
+            plate_pos = sim.data.body_xpos[
+                sim.model.body_name2id(self.target_objects[1])
+            ]
+        except:
+            plate_pos = np.zeros(3)
         
-        # Height reward (lift object)
-        height_reward = max(0, obj_pos[2] - 0.05) * 10
+        # Distance 1: gripper to bowl (exp(-dist^2 * 5))
+        dist_gripper_bowl = np.linalg.norm(gripper_pos - bowl_pos)
+        reward_gripper_bowl = np.exp(-dist_gripper_bowl * dist_gripper_bowl * 5.0)
         
-        # Action penalty
-        action_penalty = -0.01 * np.sum(np.square(action))
+        # Distance 2: bowl to plate (exp(-dist^2 * 5))
+        dist_bowl_plate = np.linalg.norm(bowl_pos - plate_pos)
+        reward_bowl_plate = np.exp(-dist_bowl_plate * dist_bowl_plate * 5.0)
         
-        reward = -dist + height_reward + action_penalty
+        # Height reward: reward for lifting bowl
+        height_reward = max(0, bowl_pos[2] - 0.05)
+        
+        reward = reward_gripper_bowl + reward_bowl_plate + height_reward
         return reward
     
     def reset(self, seed=None, options=None):
