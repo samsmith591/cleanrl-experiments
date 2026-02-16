@@ -118,7 +118,7 @@ class FastLIBEROEnv:
         return obs
     
     def _compute_reward(self, action):
-        """Dense reward: gripper->bowl + bowl->plate distances"""
+        """Dense reward: returns total and components"""
         sim = self.env.sim
         
         # Get gripper position
@@ -143,15 +143,42 @@ class FastLIBEROEnv:
         dist_gripper_bowl = np.linalg.norm(gripper_pos - bowl_pos)
         reward_gripper_bowl = np.exp(-dist_gripper_bowl * dist_gripper_bowl * 5.0)
         
-        # Distance 2: bowl to plate (exp(-dist^2 * 5))
+        # Distance 2: bowl to plate - normalized by initial distance
+        # Reward is high (close to 1) only when bowl is CLOSER than initial
         dist_bowl_plate = np.linalg.norm(bowl_pos - plate_pos)
-        reward_bowl_plate = np.exp(-dist_bowl_plate * dist_bowl_plate * 5.0)
+        if hasattr(self, 'init_bowl_plate_dist') and self.init_bowl_plate_dist > 0.001:
+            # Normalize: positive reward if closer than initial, negative if farther
+            normalized_dist = dist_bowl_plate / self.init_bowl_plate_dist
+            reward_bowl_plate = np.exp(-(normalized_dist - 1.0)**2 * 5.0)  # max at 1.0 (initial dist)
+        else:
+            reward_bowl_plate = 0
         
         # Height reward: reward for lifting bowl
         height_reward = max(0, bowl_pos[2] - 0.05)
         
         reward = reward_gripper_bowl + reward_bowl_plate + height_reward
-        return reward
+        
+        # Return total and components
+        return reward, {
+            'reward_gripper_bowl': reward_gripper_bowl,
+            'reward_bowl_plate': reward_bowl_plate,
+            'reward_height': height_reward,
+        }
+    
+        # Get initial bowl-plate distance at reset
+        self._compute_init_distance()
+        
+        return self._get_obs(), {}
+    
+    def _compute_init_distance(self):
+        """Compute initial distance between bowl and plate"""
+        sim = self.env.sim
+        try:
+            init_bowl = sim.data.body_xpos[sim.model.body_name2id(self.target_objects[0])]
+            init_plate = sim.data.body_xpos[sim.model.body_name2id(self.target_objects[1])]
+            self.init_bowl_plate_dist = np.linalg.norm(init_bowl - init_plate)
+        except:
+            self.init_bowl_plate_dist = 0.1  # default
     
     def reset(self, seed=None, options=None):
         self.current_step = 0
@@ -159,6 +186,10 @@ class FastLIBEROEnv:
         
         # Initialize ctrl
         self.env.sim.data.ctrl[:] = 0
+        
+        # Compute initial distance
+        self._compute_init_distance()
+        
         return self._get_obs(), {}
     
     def step(self, action):
@@ -173,8 +204,8 @@ class FastLIBEROEnv:
         for _ in range(self._num_sim_steps):
             self.env.sim.step()
         
-        # Compute reward
-        reward = self._compute_reward(action)
+        # Compute reward (returns total and components)
+        reward, reward_info = self._compute_reward(action)
         
         # Check termination
         self.current_step += 1
@@ -185,7 +216,7 @@ class FastLIBEROEnv:
         if truncated:
             done = True
             
-        info = {}
+        info = reward_info
         
         return self._get_obs(), reward, done, truncated, info
     

@@ -138,6 +138,9 @@ def train(args):
     if args.track:
         import wandb
         wandb.init(project=args.wandb_project_name, entity=args.wandb_entity, name=args.exp_name)
+        
+        # Log all config arguments
+        wandb.config.update(vars(args))
     
     # Set seeds
     np.random.seed(args.seed)
@@ -173,6 +176,11 @@ def train(args):
     episode_count = 0
     episode_return = 0
     
+    # Track reward components
+    episode_reward_gripper_bowl = 0
+    episode_reward_bowl_plate = 0
+    episode_reward_height = 0
+    
     # Initial observation
     next_obs, _ = env.reset()
     next_obs = next_obs.astype(np.float32)
@@ -206,6 +214,12 @@ def train(args):
             dones[step] = done or truncated
             episode_return += reward
             
+            # Track reward components
+            if isinstance(info, dict):
+                episode_reward_gripper_bowl += info.get('reward_gripper_bowl', 0)
+                episode_reward_bowl_plate += info.get('reward_bowl_plate', 0)
+                episode_reward_height += info.get('reward_height', 0)
+            
             global_step += 1
             
             if done or truncated:
@@ -213,9 +227,18 @@ def train(args):
                 next_obs = next_obs.astype(np.float32)
                 
                 if args.track:
-                    wandb.log({"episode_return": episode_return, "global_step": global_step})
+                    wandb.log({
+                        "episode_return": episode_return, 
+                        "reward_gripper_bowl": episode_reward_gripper_bowl,
+                        "reward_bowl_plate": episode_reward_bowl_plate,
+                        "reward_height": episode_reward_height,
+                        "global_step": global_step
+                    })
                 
                 episode_return = 0
+                episode_reward_gripper_bowl = 0
+                episode_reward_bowl_plate = 0
+                episode_reward_height = 0
                 episode_count += 1
         
         # Compute returns and advantages
@@ -316,6 +339,80 @@ def train(args):
     os.makedirs("runs", exist_ok=True)
     torch.save(model.state_dict(), "runs/model_final.pt")
     print("Training complete!")
+    
+    # Record and log video
+    if args.track:
+        import cv2
+        from libero.libero import benchmark, get_libero_path
+        from libero.libero.envs import DenseRewardEnv
+        
+        print("Recording evaluation video...")
+        try:
+            # Create env for recording
+            benchmark_dict = benchmark.get_benchmark_dict()
+            task_suite = benchmark_dict[args.benchmark_name]()
+            task = task_suite.get_task(args.task_id)
+            task_bddl_file = os.path.join(get_libero_path('bddl_files'), task.problem_folder, task.bddl_file)
+            
+            record_env = DenseRewardEnv(
+                bddl_file_name=task_bddl_file,
+                use_camera_obs=True,
+                has_offscreen_renderer=True,
+                camera_heights=480,
+                camera_widths=640
+            )
+            
+            obs = record_env.reset()
+            if isinstance(obs, tuple):
+                obs = obs[0]
+            
+            ctrlrange = record_env.sim.model.actuator_ctrlrange[:7]
+            
+            # Video path
+            video_file = "runs/eval_video.mp4"
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(video_file, fourcc, 30, (640, 480))
+            
+            episode_reward = 0
+            for step in range(300):
+                # Get state
+                proprio = obs.get('robot0_proprio-state', np.zeros(14)) if isinstance(obs, dict) else np.zeros(14)
+                obj_state = obs.get('object-state', np.zeros(12)) if isinstance(obs, dict) else np.zeros(12)
+                goal = np.array([0.0, 0.2, 0.0])
+                obs_state = np.concatenate([proprio, obj_state[:6], goal]).astype(np.float32)[:26]
+                if len(obs_state) < 26:
+                    obs_state = np.pad(obs_state, (0, 26 - len(obs_state)))
+                
+                # Get action from model
+                with torch.no_grad():
+                    obs_tensor = torch.FloatTensor(obs_state).to(device)
+                    action = model.get_eval_action(obs_tensor).cpu().numpy()
+                
+                action_scaled = np.clip(action, -1, 1)
+                action_muj = (action_scaled + 1) / 2 * (ctrlrange[:, 1] - ctrlrange[:, 0]) + ctrlrange[:, 0]
+                
+                obs, reward, done, info = record_env.step(action_muj)
+                if isinstance(obs, tuple):
+                    obs = obs[0]
+                episode_reward += reward
+                
+                if isinstance(obs, dict) and 'agentview_image' in obs:
+                    frame = obs['agentview_image']
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    out.write(frame)
+                
+                if done:
+                    break
+            
+            out.release()
+            record_env.close()
+            
+            # Log video
+            wandb.log({"eval_video": wandb.Video(video_file, fps=30), "eval_reward": episode_reward})
+            print(f"Video logged! Eval reward: {episode_reward}")
+        except Exception as e:
+            print(f"Video recording failed: {e}")
+    
     env.close()
     
     if args.track:
